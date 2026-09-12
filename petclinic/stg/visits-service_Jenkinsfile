@@ -1,0 +1,79 @@
+pipeline {
+    agent any
+
+    environment {
+        SERVICE    = 'visits-service'
+        DEPLOY_ENV = 'stg'
+        REGISTRY   = 'localhost:8084'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/stg']],
+                    userRemoteConfigs: [[
+                        url: 'git@github.com:Mohanadsherby/spring-petclinic-microservices.git',
+                        credentialsId: 'github-ssh-key'
+                    ]]
+                ])
+            }
+        }
+
+        stage('Set tag') {
+            steps {
+                script {
+                    def sha = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+                    env.TAG = "${sha}-${env.BUILD_NUMBER}"
+                    echo "Image tag: ${env.TAG}"
+                }
+            }
+        }
+
+        stage('Build jar') {
+            steps {
+                sh './mvnw -pl spring-petclinic-$SERVICE -am package -DskipTests'
+            }
+        }
+
+        stage('Build & push image') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'nexus-credentials', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                    sh '''
+                        docker login $REGISTRY -u $USER -p $PASS
+                        docker build --provenance=false -f devops/docker/$SERVICE/Dockerfile -t $REGISTRY/docker-hosted/$DEPLOY_ENV/$SERVICE:$TAG spring-petclinic-$SERVICE
+                        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache/trivy aquasec/trivy:latest image --scanners vuln --severity HIGH,CRITICAL --timeout 15m --exit-code 0 $REGISTRY/docker-hosted/$DEPLOY_ENV/$SERVICE:$TAG || true
+                        docker push $REGISTRY/docker-hosted/$DEPLOY_ENV/$SERVICE:$TAG
+                    '''
+                }
+            }
+        }
+
+        stage('Update manifest (GitOps)') {
+            steps {
+                dir('config-repo') {
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/main']],
+                        userRemoteConfigs: [[
+                            url: 'git@github.com:Mohanadsherby/argocd-gitops.git',
+                            credentialsId: 'github-ssh-key'
+                        ]]
+                    ])
+                }
+                sshagent(credentials: ['github-ssh-key']) {
+                    dir('config-repo') {
+                        sh '''
+                            sed -i "s|^tag:.*|tag: $TAG|" helm/petclinic/values/$DEPLOY_ENV/$SERVICE.yaml
+                            git add helm/petclinic/values/$DEPLOY_ENV/$SERVICE.yaml
+                            git commit -m "deploy $SERVICE tagged $TAG to $DEPLOY_ENV" || echo "nothing to commit"
+                            git push origin HEAD:main
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}
